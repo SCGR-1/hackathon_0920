@@ -15,8 +15,17 @@ class RealtimeDemo {
         this.playbackAudioContext = null;
         this.currentAudioSource = null;
         
+        // MeetStream bot management
+        this.currentBot = null;
+        this.meetstreamApiKey = null;
+        
+        // Transcription management
+        this.transcriptionWs = null;
+        this.transcriptions = [];
+        
         this.initializeElements();
         this.setupEventListeners();
+        this.updateSessionInfo();
         // Show HTTPS/localhost warning if needed
         this.showInsecureBannerIfNeeded();
     }
@@ -28,6 +37,24 @@ class RealtimeDemo {
         this.messagesContent = document.getElementById('messagesContent');
         this.eventsContent = document.getElementById('eventsContent');
         this.toolsContent = document.getElementById('toolsContent');
+        
+        // MeetStream elements
+        this.meetingLink = document.getElementById('meetingLink');
+        this.botName = document.getElementById('botName');
+        this.botMessage = document.getElementById('botMessage');
+        this.createBotBtn = document.getElementById('createBotBtn');
+        this.removeBotBtn = document.getElementById('removeBotBtn');
+        this.botStatus = document.getElementById('botStatus');
+        this.botInfo = document.getElementById('botInfo');
+        this.sessionInfo = document.getElementById('sessionInfo');
+        
+        // Transcription elements
+        this.transcriptionStatus = document.getElementById('transcriptionStatus');
+        this.transcriptionList = document.getElementById('transcriptionList');
+        this.testTranscriptionBtn = document.getElementById('testTranscriptionBtn');
+        this.fetchTranscriptionBtn = document.getElementById('fetchTranscriptionBtn');
+        this.manualTranscriptionInput = document.getElementById('manualTranscriptionInput');
+        this.manualTranscriptionBtn = document.getElementById('manualTranscriptionBtn');
     }
     
     setupEventListeners() {
@@ -41,6 +68,33 @@ class RealtimeDemo {
         
         this.muteBtn.addEventListener('click', () => {
             this.toggleMute();
+        });
+        
+        // MeetStream event listeners
+        this.createBotBtn.addEventListener('click', () => {
+            this.createMeetStreamBot();
+        });
+        
+        this.removeBotBtn.addEventListener('click', () => {
+            this.removeMeetStreamBot();
+        });
+        
+        // Connect to transcription WebSocket when main connection is established
+        this.connectTranscription();
+        
+        // Test transcription button
+        this.testTranscriptionBtn.addEventListener('click', () => {
+            this.testTranscription();
+        });
+        
+        // Fetch transcriptions button
+        this.fetchTranscriptionBtn.addEventListener('click', () => {
+            this.fetchTranscriptions();
+        });
+        
+        // Manual transcription button
+        this.manualTranscriptionBtn.addEventListener('click', () => {
+            this.addManualTranscription();
         });
     }
     
@@ -497,6 +551,349 @@ class RealtimeDemo {
         } else {
             banner.style.display = 'none';
         }
+    }
+    
+    // MeetStream Bot Management
+    async createMeetStreamBot() {
+        const meetingLink = this.meetingLink.value.trim();
+        const botName = this.botName.value.trim();
+        const botMessage = this.botMessage.value.trim();
+        
+        if (!meetingLink) {
+            alert('Please enter a meeting link');
+            return;
+        }
+        
+        // API key will be handled by the server using .env file
+        
+        this.createBotBtn.disabled = true;
+        this.createBotBtn.textContent = 'Creating...';
+        
+        try {
+            const response = await fetch('/api/meetstream/create-bot', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    meeting_link: meetingLink,
+                    bot_name: botName,
+                    bot_message: botMessage
+                })
+            });
+            
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+            
+            const result = await response.json();
+            this.currentBot = result;
+            
+            this.updateBotStatus('online', `Bot created: ${result.bot_id}`);
+            this.removeBotBtn.disabled = false;
+            this.botInfo.textContent = `Bot ID: ${result.bot_id} | Transcript ID: ${result.transcript_id}`;
+            
+        } catch (error) {
+            console.error('Failed to create bot:', error);
+            alert(`Failed to create bot: ${error.message}`);
+            this.updateBotStatus('offline', 'Failed to create bot');
+        } finally {
+            this.createBotBtn.disabled = false;
+            this.createBotBtn.textContent = 'Create Bot';
+        }
+    }
+    
+    async removeMeetStreamBot() {
+        if (!this.currentBot) return;
+        
+        this.removeBotBtn.disabled = true;
+        this.removeBotBtn.textContent = 'Removing...';
+        
+        try {
+            const response = await fetch('/api/meetstream/remove-bot', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    bot_id: this.currentBot.bot_id
+                })
+            });
+            
+            const result = await response.json();
+            
+            if (!response.ok) {
+                throw new Error(result.detail || `HTTP ${response.status}: ${response.statusText}`);
+            }
+            
+            this.currentBot = null;
+            this.updateBotStatus('offline', 'Bot removed and exited call');
+            this.removeBotBtn.disabled = true;
+            this.botInfo.textContent = '';
+            
+            // Show success message
+            alert('Bot has been removed and exited the meeting call!');
+            
+        } catch (error) {
+            console.error('Failed to remove bot:', error);
+            alert(`Failed to remove bot: ${error.message}`);
+        } finally {
+            this.removeBotBtn.disabled = false;
+            this.removeBotBtn.textContent = 'Remove Bot';
+        }
+    }
+    
+    updateBotStatus(status, message) {
+        const indicator = this.botStatus.querySelector('.status-indicator');
+        const text = this.botStatus.querySelector('span:last-child');
+        
+        indicator.className = `status-indicator status-${status}`;
+        text.textContent = message;
+    }
+    
+    updateSessionInfo() {
+        const info = {
+            'Session ID': this.sessionId,
+            'WebSocket URL': `ws://${window.location.host}/ws/${this.sessionId}`,
+            'Control URL': `ws://${window.location.host}/bridge`,
+            'Audio URL': `ws://${window.location.host}/bridge/audio`,
+            'Transcription URL': `ws://${window.location.host}/ws/transcription`,
+            'Connection Status': this.isConnected ? 'Connected' : 'Disconnected',
+            'Microphone': this.isCapturing ? 'Active' : 'Inactive',
+            'Transcription': this.transcriptionWs && this.transcriptionWs.readyState === WebSocket.OPEN ? 'Active' : 'Inactive'
+        };
+        
+        this.sessionInfo.innerHTML = Object.entries(info)
+            .map(([key, value]) => `<div><strong>${key}:</strong> ${value}</div>`)
+            .join('');
+    }
+    
+    // Transcription Management
+    connectTranscription() {
+        try {
+            this.transcriptionWs = new WebSocket(`ws://${window.location.host}/ws/transcription`);
+            
+            this.transcriptionWs.onopen = () => {
+                this.updateTranscriptionStatus('online', 'Connected to transcription');
+                this.updateSessionInfo();
+            };
+            
+            this.transcriptionWs.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                this.handleTranscriptionData(data);
+            };
+            
+            this.transcriptionWs.onclose = () => {
+                this.updateTranscriptionStatus('offline', 'Transcription disconnected');
+                this.updateSessionInfo();
+                // Reconnect after 3 seconds
+                setTimeout(() => this.connectTranscription(), 3000);
+            };
+            
+            this.transcriptionWs.onerror = (error) => {
+                console.error('Transcription WebSocket error:', error);
+                this.updateTranscriptionStatus('offline', 'Transcription error');
+            };
+            
+        } catch (error) {
+            console.error('Failed to connect transcription WebSocket:', error);
+        }
+    }
+    
+    handleTranscriptionData(data) {
+        if (data.type === 'transcription_history') {
+            this.transcriptions = data.data;
+            this.renderTranscriptions();
+        } else if (data.type === 'transcription_update') {
+            this.transcriptions.push(data.data);
+            this.renderTranscriptions();
+            this.updateTranscriptionStatus('online', `${this.transcriptions.length} transcriptions received`);
+        }
+    }
+    
+    renderTranscriptions() {
+        if (!this.transcriptionList) return;
+        
+        this.transcriptionList.innerHTML = this.transcriptions
+            .slice(-20) // Show last 20 entries
+            .map(transcription => `
+                <div class="transcription-entry ${transcription.id === this.transcriptions.length - 1 ? 'new' : ''}">
+                    <div class="transcription-speaker">${transcription.speaker}</div>
+                    <div class="transcription-text">${transcription.text}</div>
+                    <div class="transcription-meta">
+                        <span>${new Date(transcription.received_at).toLocaleTimeString()}</span>
+                        <span>Confidence: ${(transcription.confidence * 100).toFixed(1)}%</span>
+                    </div>
+                </div>
+            `).join('');
+        
+        // Auto-scroll to bottom
+        this.transcriptionList.scrollTop = this.transcriptionList.scrollHeight;
+    }
+    
+    updateTranscriptionStatus(status, message) {
+        if (!this.transcriptionStatus) return;
+        
+        const indicator = this.transcriptionStatus.querySelector('.status-indicator');
+        const text = this.transcriptionStatus.querySelector('span:last-child');
+        
+        if (indicator && text) {
+            indicator.className = `status-indicator status-${status}`;
+            text.textContent = message;
+        }
+    }
+    
+    async testTranscription() {
+        try {
+            this.testTranscriptionBtn.disabled = true;
+            this.testTranscriptionBtn.textContent = 'Testing...';
+            
+            const response = await fetch('/api/test-transcription', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                }
+            });
+            
+            const result = await response.json();
+            
+            if (response.ok) {
+                alert('Test transcription successful! Check the transcription panel.');
+            } else {
+                alert('Test transcription failed: ' + result.error);
+            }
+            
+        } catch (error) {
+            console.error('Test transcription error:', error);
+            alert('Test transcription error: ' + error.message);
+        } finally {
+            this.testTranscriptionBtn.disabled = false;
+            this.testTranscriptionBtn.textContent = 'Test Transcription';
+        }
+    }
+    
+    async fetchTranscriptions() {
+        try {
+            this.fetchTranscriptionBtn.disabled = true;
+            this.fetchTranscriptionBtn.textContent = 'Fetching...';
+            
+            const response = await fetch('/api/transcription', {
+                method: 'GET'
+            });
+            
+            const result = await response.json();
+            
+            if (response.ok) {
+                this.transcriptions = result.transcriptions || [];
+                this.renderTranscriptions();
+                this.updateTranscriptionStatus('online', `${this.transcriptions.length} transcriptions loaded`);
+                alert(`Fetched ${this.transcriptions.length} transcriptions from server!`);
+            } else {
+                alert('Failed to fetch transcriptions: ' + result.error);
+            }
+            
+        } catch (error) {
+            console.error('Fetch transcriptions error:', error);
+            alert('Fetch transcriptions error: ' + error.message);
+        } finally {
+            this.fetchTranscriptionBtn.disabled = false;
+            this.fetchTranscriptionBtn.textContent = 'Fetch Transcriptions';
+        }
+    }
+    
+    async addManualTranscription() {
+        try {
+            const jsonData = this.manualTranscriptionInput.value.trim();
+            if (!jsonData) {
+                alert('Please paste the webhook.site JSON data first');
+                return;
+            }
+            
+            this.manualTranscriptionBtn.disabled = true;
+            this.manualTranscriptionBtn.textContent = 'Adding...';
+            
+            // Parse the JSON data
+            const webhookData = JSON.parse(jsonData);
+            
+            const response = await fetch('/api/manual-transcription', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(webhookData)
+            });
+            
+            const result = await response.json();
+            
+            if (response.ok) {
+                alert('Manual transcription added successfully! Check the transcription panel.');
+                this.manualTranscriptionInput.value = ''; // Clear the input
+            } else {
+                alert('Manual transcription failed: ' + result.error);
+            }
+            
+        } catch (error) {
+            console.error('Manual transcription error:', error);
+            alert('Manual transcription error: ' + error.message);
+        } finally {
+            this.manualTranscriptionBtn.disabled = false;
+            this.manualTranscriptionBtn.textContent = 'Add Manual Transcription';
+        }
+    }
+}
+
+// Tool testing functions
+async function testWeather() {
+    const resultDiv = document.getElementById('weatherResult');
+    resultDiv.textContent = 'Testing weather tool...';
+    
+    try {
+        const response = await fetch('/api/test-tool', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tool: 'weather_now', params: { city: 'New York' } })
+        });
+        
+        const result = await response.json();
+        resultDiv.textContent = result.success ? result.output : `Error: ${result.error}`;
+    } catch (error) {
+        resultDiv.textContent = `Error: ${error.message}`;
+    }
+}
+
+async function testTime() {
+    const resultDiv = document.getElementById('timeResult');
+    resultDiv.textContent = 'Testing time tool...';
+    
+    try {
+        const response = await fetch('/api/test-tool', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tool: 'current_time', params: { timezone_name: 'America/New_York' } })
+        });
+        
+        const result = await response.json();
+        resultDiv.textContent = result.success ? result.output : `Error: ${result.error}`;
+    } catch (error) {
+        resultDiv.textContent = `Error: ${error.message}`;
+    }
+}
+
+async function testCanva() {
+    const resultDiv = document.getElementById('canvaResult');
+    resultDiv.textContent = 'Testing Canva tool...';
+    
+    try {
+        const response = await fetch('/api/test-tool', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tool: 'canva_create_design', params: { prompt: 'Create a simple business card' } })
+        });
+        
+        const result = await response.json();
+        resultDiv.textContent = result.success ? result.output : `Error: ${result.error}`;
+    } catch (error) {
+        resultDiv.textContent = `Error: ${error.message}`;
     }
 }
 

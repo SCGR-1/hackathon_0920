@@ -5,10 +5,16 @@ import logging
 import os
 import struct
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
 from typing_extensions import assert_never
 from starlette.websockets import WebSocketState
@@ -389,6 +395,10 @@ async def _safe_send(ws: WebSocket, payload: dict):
 
 manager = BridgeManager()
 
+# Transcription storage
+transcription_data = []
+transcription_subscribers = set()
+
 # ──────────────────────────────────────────────────────────────────────────────
 # FastAPI app + routes
 # ──────────────────────────────────────────────────────────────────────────────
@@ -549,12 +559,316 @@ async def meetstream_audio_bind(websocket: WebSocket):
         ...
 
 
+# ----- API Endpoints for Frontend Features --------------------------------------
+class CreateBotRequest(BaseModel):
+    meeting_link: str
+    bot_name: str = "AI Assistant"
+    bot_message: str = "Hello! I'm your AI assistant."
+
+class TranscriptionData(BaseModel):
+    bot_id: str
+    transcript_id: str
+    speaker: str
+    text: str
+    timestamp: str
+    confidence: float = 0.0
+
+@app.post("/api/meetstream/create-bot")
+async def create_meetstream_bot(request: CreateBotRequest):
+    """Create a MeetStream bot via API"""
+    try:
+        import httpx
+        
+        # Get API key from environment variables
+        api_key = os.getenv("MEETSTREAM_API_KEY")
+        logger.info(f"API key found: {bool(api_key)}")
+        if not api_key:
+            raise HTTPException(status_code=400, detail="MEETSTREAM_API_KEY not found in environment variables")
+        
+        # Get your server's WebSocket URLs
+        base_url = os.getenv("YOUR_SERVER_URL", "ws://localhost:8000")
+        
+        payload = {
+            "meeting_link": request.meeting_link,
+            "bot_name": request.bot_name,
+            "video_required": False,
+            "audio_required": True,
+            "bot_message": request.bot_message,
+            "bot_image_url": "https://images.pexels.com/photos/1458916/pexels-photo-1458916.jpeg",
+            "socket_connection_url": f"{base_url}/bridge",
+            "live_audio_required": {
+                "websocket_url": f"{base_url}/bridge/audio"
+            },
+            "live_transcription_required": {
+                "webhook_url": "https://webhook.site/2319925c-a7fd-4229-9d4a-f6f2a98263d1"
+            },
+            "transcription": {},
+            "custom_attributes": {
+                "tag": "AI_Agent",
+                "sample": "meetstream_integration"
+            },
+            "callback_url": ""
+        }
+        
+        logger.info(f"Sending payload to MeetStream: {payload}")
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.meetstream.ai/api/v1/bots/create_bot",
+                headers={
+                    "Authorization": f"Token {api_key}",
+                    "Content-Type": "application/json"
+                },
+                json=payload,
+                timeout=30.0
+            )
+            logger.info(f"MeetStream response status: {response.status_code}")
+            logger.info(f"MeetStream response: {response.text}")
+            
+            if response.status_code != 201:  # MeetStream expects 201 for successful creation
+                error_detail = f"MeetStream API error {response.status_code}: {response.text}"
+                logger.error(error_detail)
+                raise HTTPException(status_code=400, detail=error_detail)
+            
+            return response.json()
+            
+    except Exception as e:
+        logger.error(f"Failed to create MeetStream bot: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/meetstream/remove-bot")
+async def remove_meetstream_bot(request: dict):
+    """Remove a MeetStream bot and make it exit the call"""
+    try:
+        import httpx
+        
+        bot_id = request.get("bot_id")
+        if not bot_id:
+            raise HTTPException(status_code=400, detail="bot_id is required")
+        
+        api_key = os.getenv("MEETSTREAM_API_KEY")
+        if not api_key:
+            raise HTTPException(status_code=400, detail="MEETSTREAM_API_KEY not found in environment variables")
+        
+        logger.info(f"Removing MeetStream bot {bot_id} and making it exit the call")
+        
+        async with httpx.AsyncClient() as client:
+            # Try multiple MeetStream endpoints to remove the bot
+            endpoints_to_try = [
+                f"https://api.meetstream.ai/api/v1/bots/{bot_id}/remove_bot",
+                f"https://api.meetstream.ai/api/v1/bots/{bot_id}",
+                f"https://api.meetstream.ai/api/v1/bots/{bot_id}/leave"
+            ]
+            
+            response = None
+            for endpoint in endpoints_to_try:
+                try:
+                    logger.info(f"Trying to remove bot via: {endpoint}")
+                    
+                    # Try GET first, then DELETE
+                    for method in ['GET', 'DELETE']:
+                        if method == 'GET':
+                            response = await client.get(endpoint, headers={"Authorization": f"Token {api_key}"}, timeout=30.0)
+                        else:
+                            response = await client.delete(endpoint, headers={"Authorization": f"Token {api_key}"}, timeout=30.0)
+                        
+                        logger.info(f"Response from {method} {endpoint}: {response.status_code} - {response.text}")
+                        
+                        if response.status_code in [200, 204, 404]:
+                            break
+                    
+                    if response and response.status_code in [200, 204, 404]:
+                        break
+                        
+                except Exception as e:
+                    logger.warning(f"Failed to remove bot via {endpoint}: {e}")
+                    continue
+            
+            logger.info(f"MeetStream remove bot response: {response.status_code} - {response.text}")
+            
+            if response.status_code not in [200, 204, 404]:  # 404 means bot already removed
+                error_detail = f"MeetStream API error {response.status_code}: {response.text}"
+                logger.error(error_detail)
+                raise HTTPException(status_code=400, detail=error_detail)
+            
+            return {
+                "success": True, 
+                "message": f"Bot {bot_id} has been removed and exited the call",
+                "bot_id": bot_id
+            }
+            
+    except Exception as e:
+        logger.error(f"Failed to remove MeetStream bot: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+class TestToolRequest(BaseModel):
+    tool: str
+    params: dict = {}
+
+@app.post("/api/test-tool")
+async def test_tool(request: TestToolRequest):
+    """Test individual tools"""
+    try:
+        tool_name = request.tool
+        params = request.params
+        
+        # Import the agent to access tools
+        from agent import get_starting_agent
+        agent = get_starting_agent()
+        
+        # Find the tool
+        tool_func = None
+        for tool in agent.tools:
+            if hasattr(tool, 'name') and tool.name == tool_name:
+                tool_func = tool
+                break
+        
+        if not tool_func:
+            return {"success": False, "error": f"Tool '{tool_name}' not found"}
+        
+        # Execute the tool
+        if asyncio.iscoroutinefunction(tool_func):
+            result = await tool_func(**params)
+        else:
+            result = tool_func(**params)
+        
+        return {"success": True, "output": str(result)}
+        
+    except Exception as e:
+        logger.error(f"Tool test failed: {e}")
+        return {"success": False, "error": str(e)}
+
+@app.post("/webhook/transcription")
+async def receive_transcription(request: dict):
+    """Receive transcription data from MeetStream"""
+    try:
+        logger.info(f"Received transcription: {request}")
+        
+        # Store transcription data
+        transcription_entry = {
+            "id": len(transcription_data),
+            "bot_id": request.get("bot_id", "unknown"),
+            "speaker": request.get("speaker", "Unknown"),
+            "text": request.get("text", ""),
+            "timestamp": request.get("timestamp", ""),
+            "confidence": request.get("confidence", 0.0),
+            "received_at": datetime.now().isoformat()
+        }
+        
+        transcription_data.append(transcription_entry)
+        
+        # Keep only last 100 entries
+        if len(transcription_data) > 100:
+            transcription_data.pop(0)
+        
+        # Notify subscribers via WebSocket
+        for ws in list(transcription_subscribers):
+            try:
+                await ws.send_text(json.dumps({
+                    "type": "transcription_update",
+                    "data": transcription_entry
+                }))
+            except Exception as e:
+                logger.warning(f"Failed to send transcription to subscriber: {e}")
+                transcription_subscribers.discard(ws)
+        
+        return {"status": "success", "message": "Transcription received"}
+        
+    except Exception as e:
+        logger.error(f"Failed to process transcription: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/transcription")
+async def get_transcription():
+    """Get all transcription data"""
+    return {"transcriptions": transcription_data}
+
+@app.post("/api/test-transcription")
+async def test_transcription():
+    """Test transcription webhook with sample data"""
+    try:
+        # Simulate a transcription webhook call
+        test_data = {
+            "bot_id": "test-bot-123",
+            "transcript_id": "test-transcript-456",
+            "speaker": "Test Speaker",
+            "text": "This is a test transcription message",
+            "timestamp": datetime.now().isoformat(),
+            "confidence": 0.95
+        }
+        
+        # Process it through our webhook handler
+        result = await receive_transcription(test_data)
+        
+        return {
+            "success": True,
+            "message": "Test transcription processed",
+            "test_data": test_data,
+            "result": result
+        }
+        
+    except Exception as e:
+        logger.error(f"Test transcription failed: {e}")
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/manual-transcription")
+async def manual_transcription(request: dict):
+    """Manually add transcription data from webhook.site"""
+    try:
+        logger.info(f"Manual transcription received: {request}")
+        
+        # Extract transcription data from MeetStream webhook format
+        transcription_data = {
+            "bot_id": request.get("bot_id", "unknown"),
+            "transcript_id": request.get("transcript_id", f"manual-{len(transcription_data)}"),
+            "speaker": request.get("speaker", request.get("participant_name", "Unknown Speaker")),
+            "text": request.get("text", request.get("transcript", request.get("message", ""))),
+            "timestamp": request.get("timestamp", datetime.now().isoformat()),
+            "confidence": request.get("confidence", request.get("confidence_score", 0.0))
+        }
+        
+        # Process it through our webhook handler
+        result = await receive_transcription(transcription_data)
+        
+        return {
+            "success": True,
+            "message": "Manual transcription processed",
+            "data": transcription_data,
+            "result": result
+        }
+        
+    except Exception as e:
+        logger.error(f"Manual transcription failed: {e}")
+        return {"success": False, "error": str(e)}
+
+@app.websocket("/ws/transcription")
+async def transcription_websocket(websocket: WebSocket):
+    """WebSocket for real-time transcription updates"""
+    await websocket.accept()
+    transcription_subscribers.add(websocket)
+    
+    try:
+        # Send existing transcription data
+        await websocket.send_text(json.dumps({
+            "type": "transcription_history",
+            "data": transcription_data
+        }))
+        
+        # Keep connection alive
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        transcription_subscribers.discard(websocket)
+    except Exception as e:
+        logger.error(f"Transcription WebSocket error: {e}")
+        transcription_subscribers.discard(websocket)
+
 # ----- Static UI (optional) ------------------------------------------------------
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
+app.mount("/", StaticFiles(directory="app/static", html=True), name="static")
 
 @app.get("/")
 async def index():
-    return FileResponse("static/index.html")
+    return FileResponse("app/static/index.html")
 
 # ----- Entrypoint ----------------------------------------------------------------
 if __name__ == "__main__":
